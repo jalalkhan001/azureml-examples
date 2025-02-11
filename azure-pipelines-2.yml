@@ -1,0 +1,148 @@
+name: submit-azure-machine-learning-job
+
+trigger:
+- none
+
+variables:
+  service-connection: 'machine-learning-connection'
+  resource-group: 'devops-rg'
+  workspace: 'amlws001'
+  compute-name: 'ml-compute-cluster'
+  compute-size: 'Standard_DS3_v2'
+
+jobs:
+- job: SetupAndRunMLJob
+  displayName: Setup and Run ML Job
+  timeoutInMinutes: 300
+  pool:
+    vmImage: ubuntu-latest
+  steps:
+  - task: UsePythonVersion@0
+    displayName: Use Python >=3.8
+    inputs:
+      versionSpec: '>=3.8'
+
+  - bash: |
+      set -ex
+      az version
+      az extension add -n ml
+    displayName: 'Add AzureML Extension'
+
+  - bash: |
+      cat << EOF > environment.yml
+      name: training-env
+      channels:
+        - conda-forge
+      dependencies:
+        - python=3.8
+        - scikit-learn
+        - pandas
+        - pip
+        - pip:
+          - azureml-core
+      EOF
+    displayName: 'Create Environment YAML'
+
+  - bash: |
+      mkdir -p src
+      cat << EOF > src/train.py
+      from sklearn.linear_model import LinearRegression
+      import argparse
+      import pandas as pd
+      
+      parser = argparse.ArgumentParser()
+      parser.add_argument("--training_data", type=str, help="Path to training data")
+      parser.add_argument("--reg_rate", type=float, help="Regularization rate")
+      args = parser.parse_args()
+      
+      # Load data
+      data = pd.read_csv(args.training_data)
+      print("Data loaded successfully")
+      print("Sample data shape:", data.shape)
+      
+      # Your training code here
+      model = LinearRegression()
+      print("Training completed")
+      EOF
+    displayName: 'Create Training Script'
+
+  - bash: |
+      cat << EOF > single-job-pipeline.yml
+      \$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+      code: src
+      command: >-
+        python train.py 
+        --training_data \${{inputs.training_data}}
+        --reg_rate \${{inputs.reg_rate}}
+      compute: azureml:$(compute-name)
+      environment: azureml:training-env@latest
+      experiment_name: nyc-taxi-fare-regression
+      description: Train a regression model to predict NYC taxi fares
+      inputs:
+        training_data: 
+          type: uri_file
+          path: azureml:sample-data:1
+        reg_rate:
+          type: number
+          default: 0.01
+      EOF
+    displayName: 'Create Job Pipeline YAML'
+
+  - task: AzureCLI@2
+    displayName: Setup AML Resources
+    inputs:
+      azureSubscription: $(service-connection)
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        # Create compute cluster if it doesn't exist
+        az ml compute show -n $(compute-name) -g $(resource-group) -w $(workspace) || \
+        az ml compute create -n $(compute-name) \
+                            --type amlcompute \
+                            --min-instances 0 \
+                            --max-instances 4 \
+                            --size "$(compute-size)" \
+                            -g $(resource-group) \
+                            -w $(workspace)
+        
+        # Create environment
+        az ml environment create --file environment.yml \
+                               -g $(resource-group) \
+                               -w $(workspace)
+        
+        # Create sample data (in real scenario, replace with your actual data)
+        echo "col1,col2\n1,2\n3,4" > sample.csv
+        az ml data create --name "sample-data" \
+                         --version 1 \
+                         --path "sample.csv" \
+                         -g $(resource-group) \
+                         -w $(workspace)
+
+  - task: AzureCLI@2
+    name: submit_azureml_job_task
+    displayName: Submit and Monitor AzureML Job
+    inputs:
+      azureSubscription: $(service-connection)
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        # Submit ML job
+        job_name=$(az ml job create --file single-job-pipeline.yml -g $(resource-group) -w $(workspace) --query name --output tsv)
+        echo "Submitted job: $job_name"
+        
+        # Monitor job progress
+        while true; do
+          status=$(az ml job show -n $job_name -g $(resource-group) -w $(workspace) --query status -o tsv)
+          echo "Current status: $status"
+          
+          if [[ "$status" == "Completed" ]]; then
+            echo "Job completed successfully"
+            break
+          elif [[ "$status" == "Failed" || "$status" == "Canceled" ]]; then
+            echo "Job failed or was canceled"
+            exit 1
+          fi
+          
+          echo "Waiting for job completion..."
+          sleep 30
+        done
